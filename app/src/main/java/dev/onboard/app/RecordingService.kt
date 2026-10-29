@@ -27,6 +27,10 @@ class RecordingService : Service(), LocationListener {
             private set
         @Volatile var locationStatus = "위치 대기"
             private set
+        @Volatile var navigationStatus = "내비 대기"
+            private set
+        @Volatile var odometerStatus = "거리계 대기"
+            private set
         var lastMotionAt = 0L
             private set
     }
@@ -35,6 +39,9 @@ class RecordingService : Service(), LocationListener {
     private var visit: Long? = null
     private var motion: MotionMonitor? = null
     private var doors: DoorCollector? = null
+    private var navigation: NavigationLink? = null
+    private var odometer: OdometerCollector? = null
+    private var coverage = CoverageTracker()
     private var locationManager: LocationManager? = null
     private var latestLocation: Location? = null
     private var parked: Boolean? = null
@@ -74,7 +81,7 @@ class RecordingService : Service(), LocationListener {
             val open = PendingIntent.getActivity(this, 0, Intent(this, MainActivity::class.java), PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT)
             val stop = PendingIntent.getService(this, 1, Intent(this, RecordingService::class.java).setAction(STOP), PendingIntent.FLAG_IMMUTABLE)
             startForeground(11, Notification.Builder(this, "recording")
-                .setSmallIcon(android.R.drawable.ic_menu_mylocation).setContentTitle("Onboard · 차량 이력 기록 중")
+                .setSmallIcon(android.R.drawable.ic_menu_mylocation).setContentTitle("${getString(R.string.app_name)} · 방문 기록 중")
                 .setContentText("이 기기에만 저장 · 눌러서 기록 상태 확인").setContentIntent(open)
                 .addAction(Notification.Action.Builder(null, "기록 중지", stop).build()).setOngoing(true).build())
             session = store.startSession()
@@ -83,6 +90,14 @@ class RecordingService : Service(), LocationListener {
             lastMotionAt = SystemClock.elapsedRealtime()
             motion = MotionMonitor(this, ::updateMotion).also { it.start() }
             doors = DoorCollector(this, ::recordDoor, ::updateDoorStatus).also { it.start() }
+            coverage = CoverageTracker()
+            navigation = NavigationLink(this, { navigationStatus = it }) { kind, name, address ->
+                if (running) store.navigation(session, visit, kind, name, address)
+            }.also { it.start() }
+            odometer = OdometerCollector(this, { km, elapsed, wall ->
+                if (running) coverage.sample(km, elapsed, wall, usableLocation()?.elapsedRealtimeNanos?.div(1_000_000))
+                    ?.let { store.gap(session, it) }
+            }, { odometerStatus = it }).also { it.start() }
             subscribeLocations()
             handler.post(watchdog)
         } catch (e: Exception) {
@@ -100,7 +115,10 @@ class RecordingService : Service(), LocationListener {
             visit = null
             parked = value
         }
-        if (value == true && visit == null) visit = store.beginVisit(session)
+        if (value == true && visit == null) {
+            visit = store.beginVisit(session)
+            navigation?.refresh()
+        }
         visit?.let { id -> usableLocation()?.let { store.location(id, it.latitude, it.longitude, it.accuracy) } }
     }
 
@@ -159,13 +177,15 @@ class RecordingService : Service(), LocationListener {
 
     private fun stopRecording() {
         running = false
-        handler.removeCallbacksAndMessages(null)
-        motion?.close(); motion = null
-        doors?.close(); doors = null
-        locationManager?.removeUpdates(this)
         visit?.let { store.endVisit(it, "기록 중지") }; visit = null
         if (session != 0L) store.endSession(session, "기록 중지")
         session = 0
+        handler.removeCallbacksAndMessages(null)
+        motion?.close(); motion = null
+        doors?.close(); doors = null
+        navigation?.close(); navigation = null
+        odometer?.close(); odometer = null
+        locationManager?.removeUpdates(this)
         parked = null
         stopForeground(STOP_FOREGROUND_REMOVE)
     }

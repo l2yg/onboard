@@ -1,0 +1,14 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <color name="canvas">#EFF3FA</color>
+    <color name="surface">#FFFFFF</color>
+    <color name="ink">#142033</color>
+    <color name="muted">#536176</color>
+    <color name="accent">#2554CC</color>
+    <color name="on_accent">#FFFFFF</color>
+    <color name="soft">#E8EFFD</color>
+    <color name="outline">#7A8BA4</color>
+    <color name="hero">#233D30</color>
+    <color name="on_hero">#F4F7EB</color>
+    <color name="hero_muted">#C2D2C2</color>
+</resources>

@@ -37,7 +37,7 @@ class RecordingServiceTest {
                 await("위치 공급자로부터 실제 측정값을 받지 못함") { count(store, "locations", "accuracy <= 100") > 0 }
                 context.startService(Intent(context, RecordingService::class.java).setAction(RecordingService.STOP))
                 await("기록 중지 실패") { !RecordingService.running }
-                assertTrue(store.visits(false).all { it.end != null })
+                await("기록 중지 후 정차 종료 저장이 완료되지 않음") { store.visits(false).all { it.end != null } }
                 scenario.moveToState(Lifecycle.State.RESUMED)
                 SystemClock.sleep(3_000)
                 instrumentation.uiAutomation.takeScreenshot()?.let { screenshot ->
@@ -49,7 +49,7 @@ class RecordingServiceTest {
     }
 
     private fun count(store: HistoryStore, table: String, condition: String): Long =
-        store.readableDatabase.rawQuery("SELECT COUNT(*) FROM $table WHERE $condition", null).use { it.moveToFirst(); it.getLong(0) }
+        store.readableDatabase.rawQuery("SELECT ${if (table == "events") "COALESCE(SUM(occurrences),0)" else "COUNT(*)"} FROM $table WHERE $condition", null).use { it.moveToFirst(); it.getLong(0) }
 
     private fun await(message: String, condition: () -> Boolean) {
         val until = SystemClock.elapsedRealtime() + 25_000

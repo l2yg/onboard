@@ -5,13 +5,14 @@ import android.app.Activity
 import android.app.AlertDialog
 import android.app.DatePickerDialog
 import android.app.Dialog
-import android.app.TimePickerDialog
 import android.content.Intent
+import android.content.Context
 import android.content.pm.PackageManager
 import android.content.res.ColorStateList
-import android.graphics.Color
+import android.content.res.Configuration
 import android.graphics.Typeface
 import android.graphics.drawable.GradientDrawable
+import android.graphics.drawable.RippleDrawable
 import android.os.Build
 import android.os.Bundle
 import android.os.Handler
@@ -20,8 +21,13 @@ import android.os.SystemClock
 import android.text.Editable
 import android.text.TextWatcher
 import android.view.View
+import android.view.Gravity
+import android.view.MotionEvent
+import android.view.ViewGroup
+import android.view.inputmethod.InputMethodManager
 import android.widget.Button
-import android.widget.CheckBox
+import android.widget.ArrayAdapter
+import android.widget.ImageView
 import android.widget.EditText
 import android.widget.LinearLayout
 import android.widget.ScrollView
@@ -33,32 +39,40 @@ import java.util.Date
 import java.util.Locale
 
 class MainActivity : Activity() {
-    private val bg = Color.rgb(16, 29, 36)
-    private val panel = Color.rgb(28, 44, 52)
-    private val accent = Color.rgb(156, 230, 197)
-    private val muted = Color.rgb(173, 190, 196)
+    private val bg get() = getColor(R.color.canvas)
+    private val panel get() = getColor(R.color.surface)
+    private val accent get() = getColor(R.color.accent)
+    private val muted get() = getColor(R.color.muted)
+    private val ink get() = getColor(R.color.ink)
+    private val soft get() = getColor(R.color.soft)
+    private val buttonHeight get() = dp((80 * resources.configuration.fontScale.coerceAtLeast(1f)).toInt())
     private lateinit var store: HistoryStore
+    private lateinit var addresses: VisitAddressResolver
     private lateinit var content: LinearLayout
+    private var scroller: ScrollView? = null
+    private var renderedPage = ""
     private val handler = Handler(Looper.getMainLooper())
     private var monitor: MotionMonitor? = null
+    private var navigation: NavigationLink? = null
     private var parked: Boolean? = null
     private var motionAt = 0L
     private var demo = false
     private var page = "home"
-    private var selectedCase: Long? = null
     private var editingCase: Long? = null
     private var itemDraft = ""
     private var memoryDraft = ""
-    private var areaDraft = ""
-    private var anchorDraft: Long? = null
-    private var certainDraft = false
+    private var allVisits = false
+    private var itemInput: EditText? = null
+    private var noteVisit: Long? = null
+    private var replayFrom: Long? = null
+    private var filterDay: Long? = null
     private var statusLabel: TextView? = null
     private var activeDialog: Dialog? = null
     private var lastRunning = false
     private var pendingStart = false
     private var lastVisits = ""
-    private val doorOptions = linkedMapOf("" to "모름 · 모든 문 기록 보기", "ROW_1_LEFT" to "앞줄 왼쪽 문",
-        "ROW_1_RIGHT" to "앞줄 오른쪽 문", "ROW_2_LEFT" to "뒷줄 왼쪽 문", "ROW_2_RIGHT" to "뒷줄 오른쪽 문")
+    private var touching = false
+    private var pendingRender = false
     private val ticker = object : Runnable {
         override fun run() {
             if (motionAt != 0L && SystemClock.elapsedRealtime() - motionAt > 6_000 && parked != null) {
@@ -73,22 +87,39 @@ class MainActivity : Activity() {
             statusLabel?.text = statusText()
             if (lastRunning != RecordingService.running && page == "home") render()
             if (page == "home" && allowed() && lastVisits != visitSignature()) render()
+            if (!demo && allowed() && (page == "home" || page == "results")) {
+                store.visits(false).take(if (page == "home" && !allVisits) 5 else 200).forEach(addresses::request)
+            }
             handler.postDelayed(this, 1_000)
         }
+    }
+
+    override fun attachBaseContext(newBase: Context) {
+        val mode = newBase.getSharedPreferences("MainActivity", 0).getString("appearance", "system")
+        val night = when (mode) { "light" -> Configuration.UI_MODE_NIGHT_NO; "dark" -> Configuration.UI_MODE_NIGHT_YES; else -> null }
+        val base = if (night == null) newBase else newBase.createConfigurationContext(Configuration(newBase.resources.configuration).apply {
+            uiMode = (uiMode and Configuration.UI_MODE_NIGHT_MASK.inv()) or night
+        })
+        super.attachBaseContext(base)
     }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         store = HistoryStore(this)
+        addresses = VisitAddressResolver(this) { visit, address ->
+            if (store.saveAddress(visit, address) && allowed() && (page == "home" || page == "results")) {
+                if (touching || activeDialog?.isShowing == true) pendingRender = true else render()
+            }
+        }
         demo = savedInstanceState?.getBoolean("demo") ?: getPreferences(0).getBoolean("demo", false)
         page = savedInstanceState?.getString("page") ?: "home"
-        selectedCase = savedInstanceState?.getLong("selected", -1)?.takeIf { it >= 0 }
         editingCase = savedInstanceState?.getLong("editing", -1)?.takeIf { it >= 0 }
         itemDraft = savedInstanceState?.getString("item") ?: ""
         memoryDraft = savedInstanceState?.getString("memory") ?: ""
-        areaDraft = savedInstanceState?.getString("area") ?: ""
-        anchorDraft = savedInstanceState?.getLong("anchor", -1)?.takeIf { it >= 0 }
-        certainDraft = savedInstanceState?.getBoolean("certain") ?: false
+        allVisits = savedInstanceState?.getBoolean("allVisits") ?: false
+        noteVisit = savedInstanceState?.getLong("noteVisit", -1)?.takeIf { it >= 0 }
+        replayFrom = savedInstanceState?.getLong("replayFrom", -1)?.takeIf { it >= 0 }
+        filterDay = savedInstanceState?.getLong("filterDay", -1)?.takeIf { it >= 0 }
         render()
     }
 
@@ -100,57 +131,90 @@ class MainActivity : Activity() {
             if (parked != value) {
                 parked = value
                 if (!allowed()) activeDialog?.dismiss()
-                render()
+                if (!allowed() || !touching) render() else pendingRender = true
             }
         }.also { it.start() }
         handler.post(ticker)
         render()
     }
     override fun onPause() {
+        touching = false; pendingRender = false
+        navigation?.close(); navigation = null
         handler.removeCallbacksAndMessages(null)
         monitor?.close(); monitor = null; parked = null
         super.onPause()
     }
-    override fun onDestroy() { activeDialog?.dismiss(); store.close(); super.onDestroy() }
+    override fun onDestroy() { addresses.close(); activeDialog?.dismiss(); store.close(); super.onDestroy() }
+    override fun dispatchTouchEvent(event: MotionEvent): Boolean {
+        if (event.actionMasked == MotionEvent.ACTION_DOWN) touching = true
+        val handled = super.dispatchTouchEvent(event)
+        if (event.actionMasked == MotionEvent.ACTION_UP || event.actionMasked == MotionEvent.ACTION_CANCEL) {
+            touching = false
+            if (pendingRender) {
+                pendingRender = false
+                handler.postDelayed({ if (touching) pendingRender = true else render() }, 150)
+            }
+        }
+        return handled
+    }
     override fun onSaveInstanceState(out: Bundle) {
         out.putBoolean("demo", demo); out.putString("page", page)
-        out.putLong("selected", selectedCase ?: -1); out.putLong("editing", editingCase ?: -1)
-        out.putString("item", itemDraft); out.putString("memory", memoryDraft); out.putString("area", areaDraft)
-        out.putLong("anchor", anchorDraft ?: -1); out.putBoolean("certain", certainDraft)
+        out.putLong("editing", editingCase ?: -1)
+        out.putString("item", itemDraft); out.putString("memory", memoryDraft)
+        out.putBoolean("allVisits", allVisits)
+        out.putLong("noteVisit", noteVisit ?: -1); out.putLong("replayFrom", replayFrom ?: -1); out.putLong("filterDay", filterDay ?: -1)
         super.onSaveInstanceState(out)
     }
 
     private fun allowed() = parked == true || (demo && parked == null)
 
     private fun render() {
+        val savedScroll = if (renderedPage == page) scroller?.scrollY ?: 0 else 0
+        renderedPage = page
+        itemInput = null
         statusLabel = null
         lastRunning = RecordingService.running
         val wide = resources.configuration.screenWidthDp >= 840
         val root = LinearLayout(this).apply {
-            orientation = if (wide) LinearLayout.HORIZONTAL else LinearLayout.VERTICAL
-            setPadding(dp(24), dp(20), dp(24), dp(16)); setBackgroundColor(bg)
+            orientation = LinearLayout.VERTICAL
+            setPadding(dp(if (wide) 32 else 20), dp(20), dp(if (wide) 32 else 20), dp(20)); setBackgroundColor(bg)
         }
-        val nav = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL; setPadding(0, 0, dp(if (wide) 24 else 0), dp(12)) }
-        nav.addView(label("ONBOARD", 22, accent, true))
-        nav.addView(label(if (demo) "시연 모드 · 모의 기록" else "분실물 역추적", 14, muted))
-        val tabs = LinearLayout(this).apply { orientation = if (wide) LinearLayout.VERTICAL else LinearLayout.HORIZONTAL }
-        listOf("home" to "오늘의 기록", "cases" to "물건 찾기", "settings" to "기록 설정").forEach { (key, name) ->
-            tabs.addView(button(name, page == key) { page = key; render() },
-                if (wide) LinearLayout.LayoutParams(-1, dp(58)).apply { topMargin = dp(10) }
-                else LinearLayout.LayoutParams(0, dp(56), 1f).apply { marginEnd = dp(8) })
+        val nav = LinearLayout(this).apply { orientation = if (wide) LinearLayout.HORIZONTAL else LinearLayout.VERTICAL; gravity = Gravity.CENTER_VERTICAL; setPadding(0, 0, 0, dp(20)) }
+        val brand = LinearLayout(this).apply { gravity = Gravity.CENTER_VERTICAL }
+        brand.addView(ImageView(this).apply { setImageResource(R.drawable.ic_onboard); importantForAccessibility = View.IMPORTANT_FOR_ACCESSIBILITY_NO },
+            LinearLayout.LayoutParams(dp(48), dp(48)).apply { marginEnd = dp(16) })
+        brand.addView(LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            addView(label(getString(R.string.app_name), 30, ink, true))
+            if (demo) addView(label("연습용 기록", 22, muted))
+        })
+        nav.addView(brand, if (wide) LinearLayout.LayoutParams(0, -2, 1f) else LinearLayout.LayoutParams(-1, -2))
+        val tabs = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
+        listOf("home" to "방문 기록", "cases" to "내 메모", "settings" to "기록 설정").forEachIndexed { index, (key, name) ->
+            val selected = page == key || (key == "cases" && page == "edit") || (key == "home" && page == "results")
+            val tab = button(name) { leaveEditor(key) }.apply {
+                gravity = Gravity.CENTER
+                isSelected = selected
+                setTextColor(if (selected) panel else ink)
+                background = RippleDrawable(ColorStateList.valueOf(getColor(R.color.outline)), shape(if (selected) ink else panel), null)
+            }
+            tabs.addView(tab,
+                if (wide) LinearLayout.LayoutParams(dp((180 * resources.configuration.fontScale.coerceAtLeast(1f)).toInt()), -2).apply { if (index > 0) marginStart = dp(12) }
+                else LinearLayout.LayoutParams(0, -2, 1f).apply { if (index > 0) marginStart = dp(8) })
         }
-        nav.addView(tabs)
-        root.addView(nav, if (wide) LinearLayout.LayoutParams(dp(220), -1) else LinearLayout.LayoutParams(-1, -2))
-        val scroll = ScrollView(this).apply { isFillViewport = true }
-        content = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL; setPadding(dp(4), 0, dp(4), dp(24)) }
+        nav.addView(tabs, if (wide) LinearLayout.LayoutParams(-2, -2) else LinearLayout.LayoutParams(-1, -2).apply { topMargin = dp(12) })
+        root.addView(nav, LinearLayout.LayoutParams(-1, -2))
+        val scroll = ScrollView(this).apply { isFillViewport = true; background = shape(panel); clipToOutline = true }
+        scroller = scroll
+        scroll.post { if (scroller === scroll) scroll.scrollTo(0, savedScroll) }
+        content = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL; setPadding(dp(if (wide) 32 else 20), dp(28), dp(if (wide) 32 else 20), dp(28)) }
         scroll.addView(content)
-        root.addView(scroll, if (wide) LinearLayout.LayoutParams(0, -1, 1f) else LinearLayout.LayoutParams(-1, 0, 1f))
+        root.addView(scroll, LinearLayout.LayoutParams(-1, 0, 1f))
         setContentView(root)
-        if (demo) banner("시연용 가상 기록입니다. 실제 차량 기록과 섞이지 않습니다.", accent)
         if (!allowed() && page != "home" && page != "settings") {
             heading(if (parked == false) "정차 후 확인해 주세요" else "정차 상태를 확인하고 있어요")
             paragraph("기어 P와 정차 신호가 확인되면 상세 조작을 사용할 수 있습니다.")
-            add(button("오늘의 기록으로") { page = "home"; render() })
+            add(button("방문 기록으로") { page = "home"; render() })
             return
         }
         when (page) { "home" -> home(); "cases" -> cases(); "edit" -> editor(); "results" -> results(); else -> settings() }
@@ -158,165 +222,286 @@ class MainActivity : Activity() {
 
     private fun home() {
         lastVisits = visitSignature()
-        heading("어디서 마지막으로\n보셨나요?")
-        paragraph("기억과 차량 기록을 나란히 보고, 다시 확인할 곳을 정리해 보세요.")
-        card {
-            addView(label(if (RecordingService.running) "● 차량 이력 기록 중" else "○ 차량 이력 기록 중지", 20, accent, true))
-            statusLabel = label(statusText(), 16, muted).also { addView(it) }
+        heading("다녀온 곳")
+        val dayEnd = filterDay?.let { Calendar.getInstance().apply { timeInMillis = it; add(Calendar.DATE, 1) }.timeInMillis }
+        val visits = if (allowed()) store.visits(demo).filter { visit -> filterDay?.let { day -> visit.start >= day && visit.start < dayEnd!! } ?: (visit.start >= System.currentTimeMillis() - 7 * 86_400_000L) } else emptyList()
+        paragraph((filterDay?.let { SimpleDateFormat("M월 d일 EEEE", Locale.KOREA).format(Date(it)) } ?: "최근 7일") + if (allowed()) " · 방문 ${visits.size}곳" else " · 정차 후 확인")
+        val horizontalDates = resources.configuration.screenWidthDp >= 840
+        val days = LinearLayout(this).apply { orientation = if (horizontalDates) LinearLayout.HORIZONTAL else LinearLayout.VERTICAL }
+        listOf("오늘" to 0, "어제" to -1).forEach { (title, offset) ->
+            days.addView(button(title) {
+                if (allowed()) {
+                    filterDay = Calendar.getInstance().apply {
+                        add(Calendar.DATE, offset); set(Calendar.HOUR_OF_DAY, 0); set(Calendar.MINUTE, 0); set(Calendar.SECOND, 0); set(Calendar.MILLISECOND, 0)
+                    }.timeInMillis
+                    allVisits = false; render()
+                } else toast("정차 후 날짜를 선택해 주세요")
+            }.apply {
+                val selected = filterDay?.let { SimpleDateFormat("yyyyMMdd", Locale.KOREA).format(Date(it)) == SimpleDateFormat("yyyyMMdd", Locale.KOREA).format(Calendar.getInstance().apply { add(Calendar.DATE, offset) }.time) } == true
+                isSelected = selected
+                if (selected) background = RippleDrawable(ColorStateList.valueOf(getColor(R.color.outline)), shape(soft), null)
+            }, LinearLayout.LayoutParams(if (horizontalDates) 0 else -1, -2, if (horizontalDates) 1f else 0f).apply {
+                if (offset == -1) { if (horizontalDates) marginStart = dp(12) else topMargin = dp(12) }
+            })
+        }
+        days.addView(button(filterDay?.let { SimpleDateFormat("M월 d일", Locale.KOREA).format(Date(it)) + " · 날짜 변경" } ?: "최근 7일 · 날짜 선택") { chooseDay() },
+            LinearLayout.LayoutParams(if (horizontalDates) 0 else -1, -2, if (horizontalDates) 2f else 0f).apply { if (horizontalDates) marginStart = dp(12) else topMargin = dp(12) })
+        add(days)
+        if (filterDay != null) add(button("최근 7일 전체 보기") { filterDay = null; allVisits = false; render() })
+        val recording = LinearLayout(this).apply {
+            gravity = Gravity.CENTER_VERTICAL; setPadding(dp(18), dp(8), dp(12), dp(8)); background = shape(soft)
+            val summary = LinearLayout(this@MainActivity).apply {
+                orientation = LinearLayout.VERTICAL
+                addView(label(if (demo) "모의 기록" else if (RecordingService.running) "● 기록 중" else "기록이 멈춰 있어요", 18, ink, true))
+                statusLabel = label(statusText(), 13, muted).also { addView(it) }
+            }
+            addView(summary, LinearLayout.LayoutParams(0, -2, 1f))
+            if (!demo) addView(button(if (RecordingService.running) "기록 중지" else "기록 시작", !RecordingService.running) {
+                if (RecordingService.running) startService(Intent(this@MainActivity, RecordingService::class.java).setAction(RecordingService.STOP)) else requestRecording()
+                handler.postDelayed({ render() }, 500)
+            }, LinearLayout.LayoutParams(dp((180 * resources.configuration.fontScale.coerceAtLeast(1f)).toInt()), -2))
+        }
+        if (!demo) add(recording) else statusLabel = null
+        if (!demo) {
             if (checkSelfPermission("android.car.permission.CAR_SPEED") != PackageManager.PERMISSION_GRANTED) {
-                addView(button("차량 상태 권한 허용") {
+                add(button("차량 상태 권한 허용") {
                     requestPermissions(arrayOf("android.car.permission.CAR_SPEED"), 11)
                 })
             }
-            addView(button(if (RecordingService.running) "기록 중지" else "기록 시작", true) {
-                if (RecordingService.running) startService(Intent(this@MainActivity, RecordingService::class.java).setAction(RecordingService.STOP)) else requestRecording()
-                handler.postDelayed({ render() }, 500)
-            })
         }
-        add(button("물건 찾기 시작", true) {
-            if (allowed()) { resetDraft(); page = "edit"; render() } else toast("정차 신호 확인 후 사용할 수 있어요")
-        })
-        section("최근 방문 기록")
+        section("방문 이력")
         if (!allowed()) paragraph(if (parked == false) "주행 중에는 방문 기록을 표시하지 않습니다." else "정차 신호가 확인되면 기록을 확인할 수 있습니다.")
         else {
-            val visits = store.visits(demo)
-            if (visits.isEmpty()) paragraph("아직 기록이 없어요. 기록 시작 이후의 정차 구간부터 남습니다.")
-            visits.take(5).forEach { visitCard(it, null) }
+            if (!demo) store.gapSummaries(filterDay, dayEnd).forEach { banner(it, accent) }
+            if (visits.isEmpty()) card {
+                addView(label(if (filterDay == null) "아직 방문 기록이 없어요" else "선택한 날짜에 기록이 없어요", 22, ink, true))
+                addView(label(if (demo) "설정에서 실제 차량 기록으로 전환할 수 있어요." else "기록을 시작한 이후의 정차부터 저장됩니다.", 16, muted))
+            }
+            else {
+                if (!allVisits && visits.size > 5) paragraph("최근 방문 5곳을 먼저 보여드려요")
+                (if (allVisits) visits else visits.take(5)).forEach { visitCard(it) }
+                if (visits.size > 5) add(button(if (allVisits) "최근 5곳만 보기" else "저장된 방문 더 보기 · ${visits.size}곳") {
+                    allVisits = !allVisits; render()
+                })
+            }
         }
-        if (!demo && parked != false) add(button("모의 기록으로 사용해 보기") { switchDemo(true) })
     }
 
     private fun cases() {
-        heading("찾고 있는 물건")
-        paragraph("확인 결과와 기억을 저장해 두고 이어서 찾아보세요.")
-        add(button("새 물건 찾기", true) { resetDraft(); page = "edit"; render() })
-        val cases = store.cases(demo)
-        if (cases.isEmpty()) paragraph("진행 중인 탐색이 없어요. 물건 이름만으로도 시작할 수 있습니다.")
-        cases.forEach { search -> card {
-            addView(label(search.item, 25, Color.WHITE, true))
-            addView(label("${search.state} · ${search.anchor?.let(::time) ?: "마지막 시점 모름"}", 16, muted))
-            addView(button("복기 이어보기") { selectedCase = search.id; page = "results"; render() })
-        } }
+        heading("내 메모")
+        add(button("새 메모", true) { openNote(null) })
+        val visits = store.visits(demo).associateBy { it.id }
+        val notes = store.notes(demo)
+        if (notes.isEmpty()) paragraph("방문 중 기억할 일을 남겨보세요. 방문 상세에서도 메모할 수 있어요.")
+        notes.forEach { note ->
+            card {
+                addView(label(note.title, 22, ink, true))
+                if (note.body.isNotBlank()) addView(label(note.body, 17, muted))
+                addView(label(note.visit?.let { visits[it]?.let { v -> "${time(v.start)} · ${v.placeName}" } ?: "연결된 방문 보관 기간 만료" } ?: "일반 메모", 14, muted))
+                addView(button("메모 수정") { openNote(note.visit, note) }.apply { contentDescription = "메모 수정 · ${note.title}" })
+                visits[note.visit]?.let { visit -> addView(button("방문 보기") { showVisit(visit) }) }
+            }
+        }
+    }
+
+    private fun openNote(visit: Long?, note: VisitNote? = null) {
+        if (!allowed()) return
+        resetDraft(); noteVisit = visit; editingCase = note?.id
+        itemDraft = note?.title ?: ""; memoryDraft = note?.body ?: ""
+        page = "edit"; render()
     }
 
     private fun editor() {
-        heading(if (editingCase == null) "마지막 기억을 남겨주세요" else "기억 수정하기")
-        paragraph("정확히 기억나지 않아도 괜찮아요. 물건 위치를 미리 등록할 필요는 없습니다.")
-        section("어떤 물건을 찾으세요?")
-        field("예: 지갑, 안경, 서류", itemDraft, 80) { itemDraft = it }
-        section("마지막으로 본 시점")
-        add(button(anchorDraft?.let(::time) ?: "모름 · 시점을 선택하려면 누르세요") { chooseAnchor() })
-        add(CheckBox(this).apply {
-            text = "이 시점에 물건을 본 것이 확실해요"; textSize = 18f; setTextColor(Color.WHITE)
-            isChecked = certainDraft; minHeight = dp(56)
-            setOnCheckedChangeListener { _, checked -> certainDraft = checked }
-        })
-        section("장소나 상황에 대한 기억")
-        field("예: 마트 계산대에서 지갑을 꺼냈어요", memoryDraft, 300) { memoryDraft = it }
-        section("관련된 문 · 선택")
-        store.observedDoorAreas().forEach { if (it !in doorOptions) doorOptions[it] = "$it · 차량 제공 영역" }
-        add(button(doorOptions[areaDraft] ?: "관련 문: $areaDraft") {
-            AlertDialog.Builder(this).setTitle("기억과 관련된 문")
-                .setItems(doorOptions.values.toTypedArray()) { _, index ->
-                    areaDraft = doorOptions.keys.elementAt(index); render()
-                }.display()
-        })
-        paragraph("문 개방만으로 분실 장소를 정하지 않습니다. 기억 이전의 기록도 비교할 수 있게 남겨둡니다.")
-        add(button("방문 기록과 대조하기", true) {
+        heading(if (editingCase == null) "메모 남기기" else "메모 수정")
+        noteVisit?.let { id -> paragraph(store.visits(demo).find { it.id == id }?.let { "${time(it.start)} · ${it.placeName}" } ?: "연결된 방문 보관 기간 만료") }
+        section("제목")
+        itemInput = field("예: 카페 방문", itemDraft, 80) { itemDraft = it; itemInput?.error = null }
+        section("내용 · 선택")
+        field("기억할 일을 남겨보세요", memoryDraft, 500) { memoryDraft = it }
+        add(button("메모 저장", true) {
             if (!allowed()) return@button
-            if (itemDraft.isBlank()) { toast("찾는 물건 이름을 입력해 주세요"); return@button }
-            selectedCase = store.saveCase(editingCase, itemDraft.trim(), anchorDraft, certainDraft, memoryDraft.trim(), areaDraft.trim(), demo)
-            page = "results"; render()
+            if (itemDraft.isBlank()) {
+                itemInput?.apply { error = "메모 제목을 입력해 주세요"; requestFocus() }
+                return@button
+            }
+            getSystemService(InputMethodManager::class.java).hideSoftInputFromWindow(itemInput?.windowToken, 0)
+            store.saveNote(editingCase, noteVisit, itemDraft.trim(), memoryDraft.trim(), demo)
+            resetDraft(); page = "cases"; render(); toast("메모를 저장했어요")
         })
-        add(button("취소") { page = "cases"; render() })
+        add(button("취소") { leaveEditor("cases") })
+        editingCase?.let { id -> add(button("메모 삭제") {
+            AlertDialog.Builder(this).setTitle("이 메모를 삭제할까요?")
+                .setPositiveButton("삭제") { _, _ -> if (allowed()) { store.deleteNote(id); resetDraft(); page = "cases"; render() } }
+                .setNegativeButton("취소", null).display()
+        }) }
     }
 
     private fun results() {
-        val search = store.cases(demo).find { it.id == selectedCase }
-        if (search == null) { page = "cases"; cases(); return }
-        heading("${search.item}\n확인할 곳을 정리해요")
-        paragraph("${search.state} · ${search.anchor?.let(::time) ?: "마지막 확인 시점 모름"}")
-        if (search.memory.isNotBlank()) banner(search.memory, muted)
-        if (search.area.isNotBlank()) paragraph("관련 문에 대한 기억: ${doorOptions[search.area] ?: search.area}")
-        paragraph("최근 방문순입니다. 분실 가능성 순위가 아닙니다. 차내 잔류와 미수집 구간도 함께 확인해 주세요.")
-        add(button("기억 수정") {
-            editingCase = search.id; itemDraft = search.item; anchorDraft = search.anchor
-            certainDraft = search.certain; memoryDraft = search.memory; areaDraft = search.area; page = "edit"; render()
-        })
-        val visits = store.visits(demo)
-        if (visits.isEmpty()) paragraph("대조할 방문 기록이 없습니다. 기록 시작 전의 이력은 복원할 수 없어요.")
-        else paragraph("저장된 최근 방문 최대 200개를 표시합니다.")
-        visits.forEach { paragraph(EvidencePolicy.memoryRelation(it.start, search.anchor, search.certain)); visitCard(it, search) }
-        if (search.state == "탐색 중") {
-            add(button("물건을 찾았어요", true) { finish(search, "찾음") })
-            add(button("못 찾았지만 탐색 종료") { finish(search, "미발견 종료") })
-        }
-        add(button("탐색 목록으로") { page = "cases"; render() })
+        heading("이 시점부터 돌아보기")
+        paragraph(replayFrom?.let { "${time(it)} 이후 · 시간순" } ?: "저장된 최근 방문 · 시간순")
+        add(button("방문 기록으로") { page = "home"; render() })
+        val visits = store.visits(demo).filter { v -> replayFrom?.let { from -> v.start >= from || v.end?.let { it > from } == true } ?: true }.sortedBy { it.start }
+        if (visits.isEmpty()) paragraph("해당 시점 이후에 저장된 방문이 없어요.")
+        if (!demo) store.gapSummaries(replayFrom).forEach { banner(it, accent) }
+        visits.forEach { visitCard(it) }
     }
 
-    private fun visitCard(visit: Visit, search: SearchCase?) = card {
-        addView(label(visit.label.ifBlank { "정차 기록 · 장소명 없음" }, 22, Color.WHITE, true))
-        addView(label("${time(visit.start)} · ${if (visit.reason.contains("시각 불명")) "종료 시각 불명" else visit.end?.let { "종료 ${clock(it)}" } ?: "관측 중"}", 16, muted))
-        addView(label(if (visit.latitude != null && visit.longitude != null)
-            String.format(Locale.US, "%.5f, %.5f · 당시 정확도 ±%.0fm", visit.latitude, visit.longitude, visit.accuracy)
-            else "위치 미확정 · 실내나 상점 위치를 알 수 없어요", 16, muted))
-        addView(label("문 상태 변경 ${visit.doors}건 · 물건 이동의 증거는 아닙니다", 16, accent))
-        if (search != null && search.area.isNotBlank()) {
-            val related = store.relatedDoorCount(visit.id, search.area)
-            addView(label(if (related > 0) "기억과 관련된 문: 상태 변경 ${related}건 관측"
-                else "관련 문 변경 기록 없음 · 확인 대상에서 제외하지 않음", 17, accent))
+    private fun visitCard(visit: Visit) = visitRow {
+        if (!visit.demo) addresses.request(visit)
+        val stack = resources.configuration.screenWidthDp < 600 && resources.configuration.fontScale > 1.2f
+        val header = LinearLayout(this@MainActivity).apply { gravity = Gravity.CENTER_VERTICAL; orientation = if (stack) LinearLayout.VERTICAL else LinearLayout.HORIZONTAL }
+        header.addView(LinearLayout(this@MainActivity).apply {
+            orientation = LinearLayout.VERTICAL; gravity = Gravity.CENTER
+            addView(label(clock(visit.start), 30, ink, true).apply { fontFeatureSettings = "tnum" })
+            addView(label(SimpleDateFormat("M.dd", Locale.KOREA).format(Date(visit.start)), 22, muted).apply { gravity = Gravity.CENTER })
+        }, LinearLayout.LayoutParams(if (stack) -2 else dp((112 * resources.configuration.fontScale.coerceAtLeast(1f)).toInt()), -2).apply { if (stack) bottomMargin = dp(12) else marginEnd = dp(20) })
+        header.addView(LinearLayout(this@MainActivity).apply {
+            orientation = LinearLayout.VERTICAL
+            addView(label(visit.placeName, 28, ink, true))
+            addView(label(if (visit.reason.contains("시각 불명")) "종료 시각 불명" else visit.end?.let {
+                val minutes = ((it - visit.start) / 60_000).coerceAtLeast(0)
+                if (minutes == 0L) "1분 미만 정차" else "${minutes}분 정차"
+            } ?: "정차 중", 22, muted))
+            addView(label(if (visit.demo) "연습용 방문" else if (visit.address.isNotBlank()) "좌표로 확인한 주소" else if (visit.latitude != null) "위치 저장됨 · 장소 이름을 붙일 수 있어요" else "위치 미확정", 22, muted))
+        }, LinearLayout.LayoutParams(if (stack) -1 else 0, -2, if (stack) 0f else 1f))
+        val wideActions = resources.configuration.screenWidthDp >= 1200 && resources.configuration.fontScale <= 1.3f
+        val actions = LinearLayout(this@MainActivity).apply {
+            orientation = if (wideActions) LinearLayout.HORIZONTAL else LinearLayout.VERTICAL
+            setPadding(0, dp(12), 0, 0)
         }
-        if (visit.reason.isNotBlank()) addView(label(visit.reason, 14, muted))
-        search?.let { store.checks(it.id)[visit.id]?.let { result -> addView(label("확인 결과: $result", 18, accent)) } }
-        addView(button("상세 기록 보기") { if (allowed()) showVisit(visit, search) })
-    }
-
-    private fun showVisit(visit: Visit, search: SearchCase?) {
-        val details = store.details(visit.id).joinToString("\n\n").ifBlank { "수신한 문 기록 없음. 문이 열리지 않았다는 뜻은 아닙니다." }
-        AlertDialog.Builder(this).setTitle(visit.label.ifBlank { time(visit.start) })
-            .setMessage("$details\n\n문 값은 차량 원시 상태입니다. 미수집 구간은 별도 확인이 필요합니다.")
-            .setPositiveButton(if (search == null) "닫기" else "확인 결과 남기기") { _, _ ->
-                if (allowed() && search != null) AlertDialog.Builder(this).setTitle("확인 결과")
-                    .setItems(arrayOf("확인했지만 못 찾음", "이곳에서 찾음", "아직 확인하지 않음")) { _, which ->
-                        if (allowed()) {
-                            store.check(search.id, visit.id, listOf("확인했지만 못 찾음", "이곳에서 찾음", "아직 확인하지 않음")[which])
-                            if (which == 1) store.finishCase(search.id, "찾음")
-                            render()
+        fun actionLayout() = LinearLayout.LayoutParams(if (wideActions) 0 else -1, -2, if (wideActions) 1f else 0f).apply {
+            if (actions.childCount > 0) { if (wideActions) marginStart = dp(12) else topMargin = dp(8) }
+        }
+        actions.addView(button("방문 보기") { if (allowed()) showVisit(visit) }
+            .apply { contentDescription = "방문 보기 · ${visit.placeName}" }, actionLayout())
+        actions.addView(button(if (page == "results") "메모 남기기" else "여기부터 돌아보기") {
+            if (allowed()) {
+                if (page == "results") openNote(visit.id)
+                else { replayFrom = visit.start; page = "results"; render() }
+            }
+        }.apply { contentDescription = "${if (page == "results") "메모 남기기" else "여기부터 돌아보기"} · ${visit.placeName}" }, actionLayout())
+        if (!visit.demo && visit.latitude?.isFinite() == true && visit.longitude?.isFinite() == true &&
+            visit.latitude in -90.0..90.0 && visit.longitude in -180.0..180.0) {
+            actions.addView(button("다시 길 안내") {
+                if (parked != true) { toast("정차 확인 후 사용할 수 있어요"); return@button }
+                AlertDialog.Builder(this@MainActivity).setTitle("기록된 정차 위치로 안내할까요?")
+                    .setMessage("현재 위치에서 새 경로를 요청합니다. 기존 내비 안내가 바뀔 수 있습니다. 기록 좌표는 매장 입구나 주차장 진입점과 다를 수 있습니다.")
+                    .setPositiveButton("길 안내 요청") { _, _ ->
+                        if (parked == true && !demo) {
+                            navigation?.close()
+                            navigation = NavigationLink(this@MainActivity, { toast(it) }).also {
+                                it.navigate(visit.latitude, visit.longitude, visit.placeName) {
+                                    parked == true && !demo && SystemClock.elapsedRealtime() - motionAt <= 6_000
+                                }
+                                it.start()
+                            }
                         }
-                    }.display()
-            }.setNeutralButton("장소 이름 붙이기") { _, _ ->
+                    }.setNegativeButton("취소", null).display()
+            }, actionLayout())
+        }
+        if (resources.configuration.screenWidthDp >= 1400 && resources.configuration.fontScale <= 1.3f) {
+            val row = LinearLayout(this@MainActivity).apply { gravity = Gravity.CENTER_VERTICAL }
+            row.addView(header, LinearLayout.LayoutParams(0, -2, 1f))
+            row.addView(actions, LinearLayout.LayoutParams(dp(if (actions.childCount > 2) 750 else 520), -2).apply { marginStart = dp(24) })
+            addView(row)
+        } else { addView(header); addView(actions) }
+    }
+
+    private fun showVisit(visit: Visit) {
+        if (!allowed()) return
+        val location = if (visit.latitude != null && visit.longitude != null)
+            String.format(Locale.US, "%.5f, %.5f · 정확도 ±%.0fm", visit.latitude, visit.longitude, visit.accuracy)
+            else "위치 미확정"
+        val body = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL; setPadding(dp(24), dp(12), dp(24), dp(12))
+            addView(label("${time(visit.start)} · ${visit.end?.let(::clock) ?: "종료 불명 또는 정차 중"}", 18, ink))
+            addView(label(location, 15, muted))
+            if (visit.address.isNotBlank()) addView(label("좌표 기준 주소: ${visit.address}\n실제 방문한 매장이나 건물을 확인한 것은 아닙니다.", 22, muted))
+            store.contextDetails(visit).forEach { addView(label(it, 15, muted)) }
+            addView(button("이 시점부터 돌아보기", true) {
+                if (allowed()) { activeDialog?.dismiss(); replayFrom = visit.start; page = "results"; render() }
+            })
+            addView(button("이 방문에 메모 남기기") { if (allowed()) { activeDialog?.dismiss(); openNote(visit.id) } })
+            addView(button("이전 이동 위치 보기") {
+                if (allowed()) { activeDialog?.dismiss(); AlertDialog.Builder(this@MainActivity).setTitle("이 방문까지 수집한 위치")
+                    .setMessage(store.approachLocations(visit).joinToString("\n\n").ifBlank { "수집된 위치가 없습니다. 이동하지 않았다는 뜻은 아닙니다." } + "\n\n이전 정차 종료 이후의 최근 50건입니다. 이전 정차가 없으면 최대 1시간 전부터 표시합니다. 좌표를 이어 실제 도로 경로로 복원하지 않습니다.")
+                    .setPositiveButton("닫기", null).display()
+                }
+            })
+            addView(button("자세한 차량 기록 보기") {
+                if (allowed()) { activeDialog?.dismiss(); AlertDialog.Builder(this@MainActivity).setTitle("수신한 차량 기록")
+                    .setMessage(store.details(visit.id).joinToString("\n\n").ifBlank { "수신한 차량 기록 없음" })
+                    .setPositiveButton("닫기", null).display()
+                }
+            })
+        }
+        AlertDialog.Builder(this).setTitle(visit.placeName)
+            .setView(ScrollView(this).apply { addView(body) })
+            .setPositiveButton("닫기", null).setNeutralButton("장소 이름 붙이기") { _, _ ->
                 if (allowed()) {
                     val input = EditText(this).apply { setText(visit.label); hint = "내가 기억하는 장소 이름" }
                     AlertDialog.Builder(this).setTitle("장소 이름").setView(input).setPositiveButton("저장") { _, _ ->
                         if (allowed()) { store.rename(visit.id, input.text.toString()); render() }
                     }.setNegativeButton("취소", null).display()
                 }
-            }.setNegativeButton("돌아가기", null).display()
-    }
-
-    private fun finish(search: SearchCase, state: String) {
-        AlertDialog.Builder(this).setTitle(if (state == "찾음") "물건을 찾으셨나요?" else "탐색을 종료할까요?")
-            .setMessage("확인 결과는 이 기기에 저장됩니다.").setPositiveButton("저장") { _, _ ->
-                if (allowed()) { store.finishCase(search.id, state); render() }
-            }.setNegativeButton("취소", null).display()
+            }.display()
     }
 
     private fun settings() {
-        heading("내 기록, 내 기기에")
-        paragraph("서버로 전송하지 않습니다. 같은 차량의 다른 사용자가 기록을 볼 수 있으므로 공유 차량에서는 기록과 삭제에 유의해 주세요.")
-        section("보관과 수집")
-        paragraph("차량·위치 원시 기록과 방문 이력은 7일간 보관하며 다음 기록 시작 시 오래된 자료를 삭제합니다. 탐색 메모·결과는 전체 삭제 전까지 남습니다. 앱 삭제 시 모두 삭제됩니다. 기기 기본 보안 저장소를 사용하며 별도 앱 암호는 제공하지 않습니다.")
-        paragraph("동의 후 기록을 시작한 이후만 수집합니다. 전원 종료·앱 강제 종료 동안에는 중단될 수 있습니다. 자동 재시작하지 않으며 다시 시작하면 중단 구간을 구분합니다.")
-        add(button(if (demo) "실제 차량 기록으로 전환" else "모의 기록으로 시연하기") { switchDemo(!demo) })
-        section("기록 삭제")
+        heading("기록 설정")
+        section("화면")
+        card {
+            addView(label("화면 모드", 20, ink, true))
+            val dark = resources.configuration.uiMode and Configuration.UI_MODE_NIGHT_MASK == Configuration.UI_MODE_NIGHT_YES
+            val appearance = getPreferences(0).getString("appearance", "system")
+            val mode = when (appearance) { "light" -> "라이트"; "dark" -> "다크"; else -> "시스템 설정 사용" }
+            addView(label("현재 ${if (dark) "다크" else "라이트"} 모드", 16, muted))
+            addView(button(mode) {
+                val options = object : ArrayAdapter<String>(this@MainActivity, android.R.layout.simple_list_item_single_choice, arrayOf("시스템 설정 사용", "라이트", "다크")) {
+                    override fun getView(position: Int, convertView: View?, parent: ViewGroup): View = super.getView(position, convertView, parent).apply {
+                        (this as TextView).textSize = 24f
+                        minimumHeight = buttonHeight; setPadding(dp(24), dp(20), dp(24), dp(20))
+                    }
+                }
+                AlertDialog.Builder(this@MainActivity).setTitle("화면 모드")
+                    .setSingleChoiceItems(options, listOf("system", "light", "dark").indexOf(appearance)) { dialog, index ->
+                        getPreferences(0).edit().putString("appearance", listOf("system", "light", "dark")[index]).apply()
+                        dialog.dismiss(); recreate()
+                    }.setNegativeButton("취소", null).display()
+            })
+            addView(label("시스템 설정을 선택하면 차량 모드와 함께 바뀝니다.", 14, muted))
+        }
+        section("저장과 보관")
+        add(button("저장 공간 절약 현황") {
+            AlertDialog.Builder(this).setTitle("필요한 기록만 가볍게 저장")
+                .setMessage("같은 차량 상태는 관측 횟수와 시간으로 묶습니다. 위치는 이동과 시간 변화를 보고 골라 저장합니다.\n\n${store.storageSummary()}\n\n받은 기록 수와 저장 행 수의 비교이며 파일 압축률은 아닙니다.")
+                .setPositiveButton("닫기", null).display()
+        })
+        card {
+            addView(label("내 기기에만 보관", 24, ink, true))
+            addView(label("방문 기록은 7일, 메모는 직접 삭제할 때까지 보관합니다.", 22, muted))
+            addView(button("보관 및 수집 안내") {
+                AlertDialog.Builder(this@MainActivity).setTitle("내 기록의 보관과 수집")
+                    .setMessage("기록은 기기에 보관하며 별도 앱 암호는 없습니다. 동일 차량의 같은 OS 사용자는 기록을 볼 수 있습니다.\n\n주소 확인은 Android 시스템 서비스를 이용하며, 좌표 조회를 위한 제공자와의 통신이 발생할 수 있습니다. 조회되지 않아도 기록한 좌표는 유지합니다.\n\n동의 후 기록 시작 이후만 수집하며, 전원 종료·강제 종료 중에는 중단될 수 있습니다. 자동 재시작하지 않습니다.\n\n전체 삭제 또는 앱 삭제 시 모든 자료를 지웁니다.")
+                    .setPositiveButton("닫기", null).display()
+            })
+        }
+        section("연습과 연결 확인")
+        add(button(if (demo) "실제 차량 기록으로 전환" else "모의 기록으로 사용해 보기") { switchDemo(!demo) })
+        add(button("연결 상태 확인") {
+            AlertDialog.Builder(this).setTitle("수집 연결 상태").setMessage(collectionStatus())
+                .setPositiveButton("닫기", null).display()
+        })
+        section("전체 삭제")
+        paragraph("수집을 중지하고 방문 기록과 메모를 모두 지웁니다.")
         add(button("전체 기록 삭제") {
             if (!allowed()) { toast("정차 확인 후 삭제할 수 있어요"); return@button }
             AlertDialog.Builder(this).setTitle("모든 기록을 삭제할까요?")
-                .setMessage("기록을 중지하고 실제·모의 방문 이력, 탐색 메모와 결과를 삭제합니다. 되돌릴 수 없습니다.")
+                .setMessage("기록을 중지하고 실제·모의 방문 기록과 모든 메모를 삭제합니다. 되돌릴 수 없습니다.")
                 .setPositiveButton("전체 삭제") { _, _ ->
                     if (allowed()) {
                         startService(Intent(this, RecordingService::class.java).setAction(RecordingService.DELETE))
-                        resetDraft(); selectedCase = null
+                        resetDraft(); replayFrom = null; filterDay = null
                         handler.postDelayed({ page = "home"; render(); toast("전체 기록을 삭제했습니다") }, 500)
                     }
                 }.setNegativeButton("취소", null).display()
@@ -327,7 +512,7 @@ class MainActivity : Activity() {
         if (demo) { toast("실제 차량 기록 모드로 전환한 후 시작해 주세요"); return }
         if (parked != true) { toast("정차 신호 확인 후 기록을 시작해 주세요"); return }
         AlertDialog.Builder(this).setTitle("차량 이력을 기록할까요?")
-            .setMessage("문 상태·정차·위치를 이 기기에 기록합니다. 알림에서 중지할 수 있습니다. 기록 이전이나 전원 종료 중의 이력은 복원하지 않습니다.")
+            .setMessage("문 상태·정차·위치·차량 거리계·내비 목적지와 도착 알림을 이 기기에 기록합니다. 저장된 위치의 주소는 Android 시스템 서비스로 조회하며 제공자와의 통신이 발생할 수 있습니다. 알림에서 중지할 수 있습니다. 기록 이전이나 전원 종료 중의 이력은 복원하지 않습니다.")
             .setPositiveButton("동의하고 시작") { _, _ ->
                 val permissions = mutableListOf<String>()
                 if (checkSelfPermission(Manifest.permission.ACCESS_FINE_LOCATION) != PackageManager.PERMISSION_GRANTED) {
@@ -362,70 +547,103 @@ class MainActivity : Activity() {
         if (value && RecordingService.running) startService(Intent(this, RecordingService::class.java).setAction(RecordingService.STOP))
         if (value) store.seedDemo()
         demo = value; getPreferences(0).edit().putBoolean("demo", demo).apply()
-        selectedCase = null; resetDraft(); page = "home"; render()
+        replayFrom = null; filterDay = null; allVisits = false; resetDraft(); page = "home"; render()
     }
-    private fun chooseAnchor() {
-        val visits = store.visits(demo)
-        val options = arrayOf("모름", "직접 날짜와 시각 선택") + visits.map { "${time(it.start)} · ${it.label.ifBlank { "정차 기록" }}" }
-        AlertDialog.Builder(this).setTitle("마지막으로 본 시점").setItems(options) { _, which ->
-            when (which) {
-                0 -> { anchorDraft = null; render() }
-                1 -> {
-                    val cal = Calendar.getInstance()
-                    DatePickerDialog(this, { _, y, m, d ->
-                        cal.set(y, m, d)
-                        TimePickerDialog(this, { _, hour, minute ->
-                            cal.set(Calendar.HOUR_OF_DAY, hour); cal.set(Calendar.MINUTE, minute); cal.set(Calendar.SECOND, 0); cal.set(Calendar.MILLISECOND, 0)
-                            if (cal.timeInMillis > System.currentTimeMillis()) toast("미래 시각은 선택할 수 없어요") else anchorDraft = cal.timeInMillis
-                            render()
-                        }, cal.get(Calendar.HOUR_OF_DAY), cal.get(Calendar.MINUTE), true).also { activeDialog = it }.show()
-                    }, cal.get(Calendar.YEAR), cal.get(Calendar.MONTH), cal.get(Calendar.DAY_OF_MONTH)).also { activeDialog = it }.show()
-                }
-                else -> { anchorDraft = visits[which - 2].start; render() }
+    private fun chooseDay() {
+        if (!allowed()) { toast("정차 확인 후 사용할 수 있어요"); return }
+        val cal = Calendar.getInstance().apply { filterDay?.let { timeInMillis = it } }
+        DatePickerDialog(this, { _, y, m, d ->
+            if (allowed()) {
+                cal.set(y, m, d, 0, 0, 0); cal.set(Calendar.MILLISECOND, 0)
+                filterDay = cal.timeInMillis; allVisits = false; render()
             }
-        }.display()
+        }, cal.get(Calendar.YEAR), cal.get(Calendar.MONTH), cal.get(Calendar.DAY_OF_MONTH)).also {
+            activeDialog = it; it.datePicker.maxDate = System.currentTimeMillis(); it.show()
+        }
     }
 
-    private fun statusText(): String = if (checkSelfPermission("android.car.permission.CAR_SPEED") != PackageManager.PERMISSION_GRANTED)
-        "차량 상태 권한을 허용하면 정차를 확인할 수 있습니다."
-        else if (RecordingService.running)
-        "${RecordingService.doorStatus}\n${RecordingService.locationStatus}\n${if (parked == true) "정차 확인" else "정차 신호 확인 필요"}"
-        else "기록 시작 이후의 이력만 남습니다.\n${if (parked == true) "기어 P · 정차 확인" else "정차 신호 확인 필요"}"
-    private fun resetDraft() { editingCase = null; itemDraft = ""; memoryDraft = ""; areaDraft = ""; anchorDraft = null; certainDraft = false }
-    private fun visitSignature() = store.visits(demo).take(5).joinToString { "${it.id}:${it.doors}:${it.end}:${it.latitude}:${it.label}" }
-    private fun AlertDialog.Builder.display() { create().also { activeDialog = it }.show() }
+    private fun statusText(): String = if (page == "settings") collectionStatus() else when {
+        demo -> "실제 차량 기록과 분리되어 있어요"
+        checkSelfPermission("android.car.permission.CAR_SPEED") != PackageManager.PERMISSION_GRANTED -> "차량 상태 권한이 필요해요"
+        parked == false -> "주행 중 · 상세 조작은 정차 후"
+        parked == null -> "정차 상태 확인 중"
+        RecordingService.running -> "정차 확인 · ${RecordingService.locationStatus}"
+        else -> "지금 시작한 이후의 방문부터 저장해요"
+    }
+    private fun collectionStatus() = if (RecordingService.running)
+        "문 · ${RecordingService.doorStatus}\n위치 · ${RecordingService.locationStatus}\n내비 · ${RecordingService.navigationStatus}\n거리계 · ${RecordingService.odometerStatus}"
+        else "수집 중지 · 기록을 시작하면 연결 상태를 확인할 수 있어요"
+    private fun leaveEditor(destination: String) {
+        if (destination == page) return
+        val original = editingCase?.let { id -> store.notes(demo).find { it.id == id } }
+        val changed = if (original == null) itemDraft.isNotBlank() || memoryDraft.isNotBlank()
+            else itemDraft != original.title || memoryDraft != original.body
+        val leave = { page = destination; resetDraft(); render() }
+        if (page == "edit" && changed) AlertDialog.Builder(this).setTitle("입력을 그만둘까요?")
+            .setMessage("저장하지 않은 내용은 사라집니다.")
+            .setPositiveButton("나가기") { _, _ -> leave() }.setNegativeButton("계속 입력", null).display()
+        else leave()
+    }
+    private fun resetDraft() { editingCase = null; noteVisit = null; itemDraft = ""; memoryDraft = "" }
+    private fun visitSignature() = store.visits(demo).take(5).joinToString { "${it.id}:${it.doors}:${it.end}:${it.latitude}:${it.label}:${it.address}" }
+    private fun AlertDialog.Builder.display() {
+        create().also { dialog ->
+            activeDialog = dialog; dialog.show()
+            dialog.findViewById<TextView>(android.R.id.message)?.apply { textSize = 22f; setLineSpacing(dp(5).toFloat(), 1.15f) }
+            listOf(AlertDialog.BUTTON_POSITIVE, AlertDialog.BUTTON_NEGATIVE, AlertDialog.BUTTON_NEUTRAL).forEach { which ->
+                dialog.getButton(which)?.apply { textSize = 24f; minHeight = buttonHeight; isAllCaps = false }
+            }
+        }
+    }
     private fun dp(value: Int) = (value * resources.displayMetrics.density).toInt()
     private fun time(value: Long) = SimpleDateFormat("MM.dd HH:mm", Locale.KOREA).format(Date(value))
     private fun clock(value: Long) = SimpleDateFormat("HH:mm", Locale.KOREA).format(Date(value))
     private fun toast(message: String) { Toast.makeText(this, message, Toast.LENGTH_LONG).show() }
-    private fun label(text: String, size: Int = 18, color: Int = Color.WHITE, bold: Boolean = false) = TextView(this).apply {
-        this.text = text; textSize = size.toFloat(); setTextColor(color); setPadding(0, dp(6), 0, dp(10))
-        if (bold) setTypeface(typeface, Typeface.BOLD)
+    private fun label(text: String, size: Int = 18, color: Int = ink, bold: Boolean = false) = TextView(this).apply {
+        this.text = text; textSize = maxOf(size.toFloat(), 22f); setTextColor(color); setPadding(0, dp(8), 0, dp(12))
+        includeFontPadding = false
+        setLineSpacing(dp(3).toFloat(), 1.1f)
+        if (bold) typeface = Typeface.create("sans-serif-medium", Typeface.NORMAL)
     }
     private fun button(text: String, primary: Boolean = false, action: () -> Unit) = Button(this).apply {
-        this.text = text; textSize = 18f; isAllCaps = false; minHeight = dp(56)
-        setPadding(dp(16), dp(8), dp(16), dp(8)); setTextColor(if (primary) bg else Color.WHITE)
-        backgroundTintList = ColorStateList.valueOf(if (primary) accent else Color.rgb(43, 61, 70))
+        this.text = text; textSize = 24f; isAllCaps = false; minHeight = buttonHeight
+        setPadding(dp(20), dp(8), dp(20), dp(8)); setTextColor(if (primary) getColor(R.color.on_accent) else ink)
+        backgroundTintList = null
+        val surface = shape(if (primary) accent else panel).apply { if (!primary) setStroke(dp(1), getColor(R.color.outline)) }
+        background = RippleDrawable(ColorStateList.valueOf(getColor(R.color.outline)), surface, null)
+        stateListAnimator = null
         setOnClickListener { action() }
     }
-    private fun add(view: View) { content.addView(view, LinearLayout.LayoutParams(-1, -2).apply { bottomMargin = dp(10) }) }
-    private fun heading(text: String) { add(label(text, 32, Color.WHITE, true)) }
-    private fun section(text: String) { add(label(text, 20, accent, true)) }
+    private fun add(view: View) { content.addView(view, LinearLayout.LayoutParams(-1, -2).apply { bottomMargin = dp(16) }) }
+    private fun heading(text: String) { add(label(text, 38, ink, true)) }
+    private fun section(text: String) { add(label(text, 20, ink, true).apply { setPadding(0, dp(16), 0, dp(4)) }) }
     private fun paragraph(text: String) { add(label(text, 17, muted)) }
     private fun banner(text: String, color: Int) { add(label(text, 16, color).apply { setPadding(dp(16), dp(12), dp(16), dp(12)); background = shape(panel) }) }
-    private fun card(body: LinearLayout.() -> Unit) { add(LinearLayout(this).apply { orientation = LinearLayout.VERTICAL; setPadding(dp(20), dp(16), dp(20), dp(16)); background = shape(panel); body() }) }
-    private fun shape(color: Int) = GradientDrawable().apply { setColor(color); cornerRadius = dp(16).toFloat() }
-    private fun field(hint: String, initial: String, limit: Int, changed: (String) -> Unit) {
-        add(EditText(this).apply {
-            this.hint = hint; textSize = 20f; setTextColor(Color.WHITE); setHintTextColor(muted)
-            minHeight = dp(60); setSingleLine(false); setText(initial); filters = arrayOf(android.text.InputFilter.LengthFilter(limit))
+    private fun card(body: LinearLayout.() -> Unit) { add(LinearLayout(this).apply { orientation = LinearLayout.VERTICAL; setPadding(dp(24), dp(20), dp(24), dp(20)); background = shape(bg); body() }) }
+    private fun visitRow(body: LinearLayout.() -> Unit) { add(LinearLayout(this).apply { orientation = LinearLayout.VERTICAL; setPadding(0, dp(12), 0, dp(20)); body() }) }
+    private fun shape(color: Int) = GradientDrawable().apply { setColor(color); cornerRadius = dp(8).toFloat() }
+    private fun field(hint: String, initial: String, limit: Int, changed: (String) -> Unit): EditText {
+        val input = EditText(this).apply {
+            this.hint = hint; textSize = 24f; setTextColor(ink); setHintTextColor(muted)
+            background = shape(panel).apply { setStroke(dp(1), getColor(R.color.outline)) }
+            setPadding(dp(20), dp(16), dp(20), dp(16))
+            minHeight = buttonHeight; setSingleLine(false); setText(initial); filters = arrayOf(android.text.InputFilter.LengthFilter(limit))
             addTextChangedListener(object : TextWatcher {
                 override fun beforeTextChanged(s: CharSequence?, start: Int, count: Int, after: Int) = Unit
                 override fun onTextChanged(s: CharSequence?, start: Int, before: Int, count: Int) { changed(s.toString()) }
                 override fun afterTextChanged(s: Editable?) = Unit
             })
-        })
+        }
+        add(input)
+        return input
     }
     @Deprecated("Deprecated in Java")
-    override fun onBackPressed() { if (page != "home") { page = "home"; render() } else super.onBackPressed() }
+    override fun onBackPressed() {
+        when (page) {
+            "edit" -> leaveEditor("cases")
+            "results" -> leaveEditor("home")
+            "cases", "settings" -> leaveEditor("home")
+            else -> super.onBackPressed()
+        }
+    }
 }
