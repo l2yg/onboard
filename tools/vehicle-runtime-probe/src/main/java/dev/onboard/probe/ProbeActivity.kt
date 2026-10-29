@@ -17,6 +17,7 @@ class ProbeActivity : Activity() {
     private val handler = Handler(Looper.getMainLooper())
     private lateinit var vehicle: Vehicle
     private lateinit var output: TextView
+    private lateinit var doorProbe: DoorProbe
     private var car: Car? = null
     private var subscribed = false
     @Volatile private var closed = false
@@ -38,17 +39,20 @@ class ProbeActivity : Activity() {
         }
         setContentView(output)
         vehicle = Vehicle(this)
+        doorProbe = DoorProbe(vehicle, ::report)
         report("begin package=$packageName sdk=Vehicle-2.3.2")
         report("permission.CAR_DRIVE=${checkSelfPermission("pleos.car.permission.CAR_DRIVE")}")
+        report("permission.CAR_DOORS=${checkSelfPermission("pleos.car.permission.CAR_DOORS")}")
         report("permission.CAR_SPEED=${checkSelfPermission("android.car.permission.CAR_SPEED")}")
         report("permission.CAR_POWERTRAIN=${checkSelfPermission("android.car.permission.CAR_POWERTRAIN")}")
         vehicle.initialize()
         handler.postDelayed({ inspectSteering() }, 2_000)
+        handler.postDelayed({ doorProbe.start() }, 2_000)
         handler.postDelayed({ Thread { inspectStandardProperties() }.start() }, 3_000)
         handler.postDelayed({
             report("observation.window.end")
             finish()
-        }, 20_000)
+        }, 120_000)
     }
 
     private fun inspectSteering() {
@@ -123,6 +127,7 @@ class ProbeActivity : Activity() {
     override fun onDestroy() {
         closed = true
         handler.removeCallbacksAndMessages(null)
+        doorProbe.close()
         if (subscribed) {
             try {
                 vehicle.getSteeringWheel().unregisterSteeringWheelAngle(angleListener)
