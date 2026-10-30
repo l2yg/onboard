@@ -24,6 +24,7 @@ import android.view.Gravity
 import android.view.MotionEvent
 import android.view.ViewGroup
 import android.view.inputmethod.InputMethodManager
+import android.view.inputmethod.EditorInfo
 import android.widget.Button
 import android.widget.ArrayAdapter
 import android.widget.ImageView
@@ -471,7 +472,13 @@ class MainActivity : Activity() {
             .setView(ScrollView(this).apply { addView(body) })
             .setPositiveButton("닫기", null).setNeutralButton("장소 이름 붙이기") { _, _ ->
                 if (allowed()) {
-                    val input = EditText(this).apply { setText(visit.label); hint = "내가 기억하는 장소 이름" }
+                    val input = EditText(this).apply {
+                        textSize = 28f; setTextColor(ink); setHintTextColor(muted)
+                        minHeight = buttonHeight; setPadding(dp(24), dp(16), dp(24), dp(16))
+                        setSingleLine(true)
+                        imeOptions = imeOptions or EditorInfo.IME_FLAG_NO_FULLSCREEN
+                        setText(visit.label); hint = "내가 기억하는 장소 이름"
+                    }
                     AlertDialog.Builder(this).setTitle("장소 이름").setView(input).setPositiveButton("저장") { _, _ ->
                         if (allowed()) { store.rename(visit.id, input.text.toString()); render() }
                     }.setNegativeButton("취소", null).display()
@@ -727,10 +734,11 @@ class MainActivity : Activity() {
     private fun shape(color: Int) = GradientDrawable().apply { setColor(color); cornerRadius = dp(8).toFloat() }
     private fun field(hint: String, initial: String, limit: Int, changed: (String) -> Unit): EditText {
         val input = EditText(this).apply {
-            this.hint = hint; textSize = 24f; setTextColor(ink); setHintTextColor(muted)
+            this.hint = hint; textSize = 28f; setTextColor(ink); setHintTextColor(muted)
             background = shape(panel).apply { setStroke(dp(1), getColor(R.color.outline)) }
             setPadding(dp(20), dp(16), dp(20), dp(16))
             minHeight = buttonHeight; setSingleLine(false); setText(initial); filters = arrayOf(android.text.InputFilter.LengthFilter(limit))
+            imeOptions = imeOptions or EditorInfo.IME_FLAG_NO_FULLSCREEN
             addTextChangedListener(object : TextWatcher {
                 override fun beforeTextChanged(s: CharSequence?, start: Int, count: Int, after: Int) = Unit
                 override fun onTextChanged(s: CharSequence?, start: Int, before: Int, count: Int) { changed(s.toString()) }

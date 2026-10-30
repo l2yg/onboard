@@ -7,14 +7,19 @@ import android.view.View
 import android.view.ViewGroup
 import android.widget.Button
 import android.widget.TextView
+import android.widget.EditText
+import android.view.inputmethod.EditorInfo
+import android.view.inputmethod.InputMethodManager
 import androidx.test.core.app.ActivityScenario
 import androidx.test.espresso.Espresso.onView
 import androidx.test.espresso.action.ViewActions.click
 import androidx.test.espresso.action.ViewActions.scrollTo
+import androidx.test.espresso.action.ViewActions.typeText
 import androidx.test.espresso.assertion.ViewAssertions.matches
 import androidx.test.espresso.matcher.ViewMatchers.isDisplayed
 import androidx.test.espresso.matcher.ViewMatchers.withContentDescription
 import androidx.test.espresso.matcher.ViewMatchers.withId
+import androidx.test.espresso.matcher.ViewMatchers.withHint
 import androidx.test.espresso.matcher.ViewMatchers.withText
 import androidx.test.ext.junit.runners.AndroidJUnit4
 import androidx.test.platform.app.InstrumentationRegistry
@@ -25,11 +30,42 @@ import java.util.Calendar
 import java.util.Locale
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertTrue
+import org.junit.Assert.assertFalse
 import org.junit.Test
 import org.junit.runner.RunWith
 
 @RunWith(AndroidJUnit4::class)
 class AppearanceFlowTest {
+    @Test fun memoInputKeepsLargeAppFieldsWhileKeyboardIsOpen() {
+        val context = InstrumentationRegistry.getInstrumentation().targetContext
+        ActivityScenario.launch<MainActivity>(context.packageManager.getLaunchIntentForPackage(context.packageName)!!).use { scenario ->
+            fun ready(view: View): Boolean = (view is TextView && view.text.toString().contains(" · 방문 ")) ||
+                (view is ViewGroup && (0 until view.childCount).any { ready(view.getChildAt(it)) })
+            var parked = false
+            val until = SystemClock.elapsedRealtime() + 8_000
+            while (!parked && SystemClock.elapsedRealtime() < until) {
+                scenario.onActivity { parked = ready(it.findViewById(android.R.id.content)) }
+                if (!parked) SystemClock.sleep(100)
+            }
+            assertTrue("정차 확인 필요", parked)
+            onView(withText("내 메모")).perform(click())
+            onView(withText("새 메모")).perform(scrollTo(), click())
+            onView(withHint("예: 카페 방문")).perform(scrollTo(), click(), typeText("Visit memo"))
+            onView(withText("메모 남기기")).check(matches(isDisplayed()))
+            onView(withHint("기억할 일을 남겨보세요")).perform(scrollTo(), click(), typeText("Remember this stop."))
+            onView(withHint("기억할 일을 남겨보세요")).check { view, error ->
+                if (error != null) throw error
+                val input = view as EditText
+                assertTrue("작은 입력 글자", input.textSize / input.resources.displayMetrics.scaledDensity >= 28f)
+                assertTrue("전체 화면 편집 방지", input.imeOptions and EditorInfo.IME_FLAG_NO_FULLSCREEN != 0)
+            }
+            scenario.onActivity {
+                assertFalse("키보드 전체 화면 편집기가 열림", it.getSystemService(InputMethodManager::class.java).isFullscreenMode)
+            }
+            capture("memo-input-large")
+        }
+    }
+
     @Test fun datePickerHasLargeTargetsAndSupportsMonthNavigation() {
         val context = InstrumentationRegistry.getInstrumentation().targetContext
         val today = Calendar.getInstance()
