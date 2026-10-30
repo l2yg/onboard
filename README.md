@@ -6,7 +6,7 @@
 
 - [개발 환경](docs/3000_구현/3001_개발_환경.md): 도구 버전·Pleos 에뮬레이터 준비·실행 방법.
 - [프로젝트 문서](docs/index.md): 공모전 조건과 SDK 조사.
-- [제출용 릴리스 APK](apk/l2yg_차량발자취_release.apk): 버전 0.1.0, 전용 키로 서명된 설치 파일.
+- [제출용 릴리스 APK](apk/이용규_차량발자취_release.apk): 버전 0.1.0, 전용 키로 서명된 설치 파일.
 - [시연 영상 · 무음](videos/시연_소리없음.mp4): 앱 실행 흐름 녹화.
 
 테스트 환경은 Pleos Connect v2.1.0 x86_64 에뮬레이터(Android 14 / API 34)입니다. Vehicle SDK 2.3.2와 NaviHelper 3.0.5를 사용하며 실차는 별도 검증하지 않았습니다. 차량 속도·위치 권한이 필요하고, 기록 시작 시 위치 및 알림 권한을 안내합니다. 실제 주소·내비 기능은 제공자 연결 및 차량 지원 상태에 영향을 받습니다.
@@ -28,7 +28,7 @@ Android Studio에서 저장소 루트를 열고 기존 Pleos AVD를 실행한 �
 ```
 
 - 설치용 개발 APK: `app/build/outputs/apk/debug/app-debug.apk`.
-- 제출용 파일은 `apk/l2yg_차량발자취_release.apk`입니다. Android Studio의 `Generate Signed App Bundle / APK`에서 release를 선택해 서명했습니다. `:app:assembleRelease`만 실행하면 별도 서명 설정이 없어 unsigned APK가 생성됩니다. 서명키와 비밀번호는 저장소에 포함하지 않습니다.
+- 제출용 파일은 `apk/이용규_차량발자취_release.apk`입니다. Android Studio의 `Generate Signed App Bundle / APK`에서 release를 선택해 서명했습니다. `:app:assembleRelease`만 실행하면 별도 서명 설정이 없어 unsigned APK가 생성됩니다. 서명키와 비밀번호는 저장소에 포함하지 않습니다.
 - 데이터는 앱 전용 SQLite에 저장하며 자체 서버·클라우드 백업을 사용하지 않습니다. 주소는 Android 시스템 Geocoder 또는 기록 좌표와 100m 이내인 Pleos 내비 위치 주소로 확인하며 제공자와의 통신이 발생할 수 있습니다. 원시 기록·방문은 기록 시작 시 7일 이전 자료를 정리하고 메모는 직접 삭제 전까지 보관합니다.
 - 실제 구현·검증 범위와 남은 항목은 [구현 계획](docs/3000_구현/3002_분실물_역추적_구현_계획.md)을 따릅니다.
 
