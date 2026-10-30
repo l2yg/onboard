@@ -91,7 +91,13 @@ class RecordingService : Service(), LocationListener {
             motion = MotionMonitor(this, ::updateMotion).also { it.start() }
             doors = DoorCollector(this, ::recordDoor, ::updateDoorStatus).also { it.start() }
             coverage = CoverageTracker()
-            navigation = NavigationLink(this, { navigationStatus = it }) { kind, name, address ->
+            navigation = NavigationLink(this, { navigationStatus = it }, location = { latitude, longitude, address ->
+                if (running && address.isNotBlank()) {
+                    visit?.let { id -> store.visits(false).firstOrNull { it.id == id }?.let { current ->
+                        store.saveAddress(current.copy(latitude = latitude, longitude = longitude), address)
+                    } }
+                }
+            }) { kind, name, address ->
                 if (running) store.navigation(session, visit, kind, name, address)
             }.also { it.start() }
             odometer = OdometerCollector(this, { km, elapsed, wall ->
@@ -165,6 +171,7 @@ class RecordingService : Service(), LocationListener {
     override fun onLocationChanged(location: Location) {
         if (!running) return
         latestLocation = location
+        navigation?.refreshLocation()
         store.locationSample(session, if (parked == true) visit else null, location.time,
             location.elapsedRealtimeNanos / 1_000_000, location.latitude, location.longitude,
             if (location.hasAccuracy()) location.accuracy else null, location.provider ?: "unknown")

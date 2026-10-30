@@ -2,6 +2,7 @@ package dev.onboard.app
 
 import android.content.res.Configuration
 import android.graphics.Bitmap
+import android.os.SystemClock
 import android.view.View
 import android.view.ViewGroup
 import android.widget.Button
@@ -10,11 +11,18 @@ import androidx.test.core.app.ActivityScenario
 import androidx.test.espresso.Espresso.onView
 import androidx.test.espresso.action.ViewActions.click
 import androidx.test.espresso.action.ViewActions.scrollTo
+import androidx.test.espresso.assertion.ViewAssertions.matches
+import androidx.test.espresso.matcher.ViewMatchers.isDisplayed
+import androidx.test.espresso.matcher.ViewMatchers.withContentDescription
+import androidx.test.espresso.matcher.ViewMatchers.withId
 import androidx.test.espresso.matcher.ViewMatchers.withText
 import androidx.test.ext.junit.runners.AndroidJUnit4
 import androidx.test.platform.app.InstrumentationRegistry
 import java.io.File
 import java.io.FileOutputStream
+import java.text.SimpleDateFormat
+import java.util.Calendar
+import java.util.Locale
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertTrue
 import org.junit.Test
@@ -22,6 +30,44 @@ import org.junit.runner.RunWith
 
 @RunWith(AndroidJUnit4::class)
 class AppearanceFlowTest {
+    @Test fun datePickerHasLargeTargetsAndSupportsMonthNavigation() {
+        val context = InstrumentationRegistry.getInstrumentation().targetContext
+        val today = Calendar.getInstance()
+        val description = SimpleDateFormat("yyyy년 M월 d일", Locale.KOREA).format(today.time)
+        ActivityScenario.launch<MainActivity>(context.packageManager.getLaunchIntentForPackage(context.packageName)!!).use { scenario ->
+            fun ready(view: View): Boolean = (view is TextView && view.text.toString().contains(" · 방문 ")) ||
+                (view is ViewGroup && (0 until view.childCount).any { ready(view.getChildAt(it)) })
+            var parked = false
+            val until = SystemClock.elapsedRealtime() + 8_000
+            while (!parked && SystemClock.elapsedRealtime() < until) {
+                scenario.onActivity { parked = ready(it.findViewById(android.R.id.content)) }
+                if (!parked) SystemClock.sleep(100)
+            }
+            assertTrue("정차 확인 후 날짜 선택이 가능해야 합니다", parked)
+            onView(withText("최근 7일 · 날짜 선택")).perform(scrollTo(), click())
+            onView(withContentDescription(description)).check { view, error ->
+                if (error != null) throw error
+                val target = view as Button
+                val density = target.resources.displayMetrics.density
+                assertTrue("날짜 터치 폭", target.width >= 80 * density)
+                assertTrue("날짜 터치 높이", target.height >= 80 * density)
+                assertTrue("날짜 글자 크기", target.textSize / target.resources.displayMetrics.scaledDensity >= 24f)
+            }
+            onView(withText("이전 달")).perform(click())
+            val previous = (today.clone() as Calendar).apply { add(Calendar.MONTH, -1) }
+            onView(withText(SimpleDateFormat("yyyy년 M월", Locale.KOREA).format(previous.time))).check(matches(isDisplayed()))
+            onView(withText("다음 달")).perform(click())
+            onView(withContentDescription(description)).perform(click())
+            onView(withId(android.R.id.button1)).check { view, error ->
+                if (error != null) throw error
+                assertTrue("확인 버튼 터치 폭", view.width >= 120 * view.resources.displayMetrics.density)
+            }
+            capture("date-picker-large")
+            onView(withId(android.R.id.button1)).perform(click())
+            onView(withText("최근 7일 전체 보기")).check(matches(isDisplayed()))
+        }
+    }
+
     @Test fun defaultTextAndButtonsAreLargeEnoughForTheSimplifiedInterface() {
         ActivityScenario.launch(MainActivity::class.java).use { scenario ->
             onView(withText("방문 기록")).perform(click())

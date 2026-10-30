@@ -23,6 +23,6 @@ Android Studio에서 저장소 루트를 열고 기존 Pleos AVD를 실행한 �
 
 - 설치용 개발 APK: `app/build/outputs/apk/debug/app-debug.apk`.
 - 릴리스 빌드: `:app:assembleRelease`, 산출물은 `app/build/outputs/apk/release/app-release-unsigned.apk`. 배포 서명은 별도 준비가 필요합니다.
-- 데이터는 앱 전용 SQLite에 저장하며 자체 서버·클라우드 백업을 사용하지 않습니다. 주소 확인은 Android 시스템 Geocoder를 사용하며 좌표 조회를 위한 제공자와의 통신이 발생할 수 있습니다. 원시 기록·방문은 기록 시작 시 7일 이전 자료를 정리하고 메모는 직접 삭제 전까지 보관합니다.
+- 데이터는 앱 전용 SQLite에 저장하며 자체 서버·클라우드 백업을 사용하지 않습니다. 주소는 Android 시스템 Geocoder 또는 기록 좌표와 100m 이내인 Pleos 내비 위치 주소로 확인하며 제공자와의 통신이 발생할 수 있습니다. 원시 기록·방문은 기록 시작 시 7일 이전 자료를 정리하고 메모는 직접 삭제 전까지 보관합니다.
 - 실제 구현·검증 범위와 남은 항목은 [구현 계획](docs/3000_구현/3002_분실물_역추적_구현_계획.md)을 따릅니다.
 

@@ -215,7 +215,7 @@ class HistoryStore(context: Context, databaseName: String = "onboard-history.db"
         "SELECT v.*, (SELECT COUNT(*) FROM events e WHERE e.visit=v.id AND e.kind='transition') AS doors FROM visits v WHERE demo=? ORDER BY started DESC LIMIT 200",
         arrayOf(if (demo) "1" else "0")
     ).use { c -> buildList { while (c.moveToNext()) add(Visit(c.long("id"), c.long("started"), c.optionalLong("ended"), c.text("label"), c.long("demo") == 1L, c.optionalDouble("lat"), c.optionalDouble("lon"), c.optionalDouble("accuracy")?.toFloat(), c.text("reason"), c.long("doors").toInt(),
-        if (nearby(c.optionalDouble("lat"), c.optionalDouble("lon"), c.optionalDouble("address_lat"), c.optionalDouble("address_lon"))) c.text("address") else "")) } }
+        if (c.long("demo") == 1L || nearby(c.optionalDouble("lat"), c.optionalDouble("lon"), c.optionalDouble("address_lat"), c.optionalDouble("address_lon"))) c.text("address") else "")) } }
 
     fun details(visitId: Long): List<String> = readableDatabase.rawQuery(
         "SELECT * FROM events WHERE visit=? ORDER BY id DESC LIMIT 100", arrayOf(visitId.toString())
@@ -258,17 +258,32 @@ class HistoryStore(context: Context, databaseName: String = "onboard-history.db"
     }
 
     fun seedDemo() {
-        if (visits(true).isNotEmpty()) return
+        val existing = visits(true)
+        if (existing.isNotEmpty()) {
+            existing.sortedBy { it.start }.forEachIndexed { index, visit ->
+                if (visit.address.isBlank()) writableDatabase.execSQL(
+                    "UPDATE visits SET address=? WHERE id=? AND demo=1",
+                    arrayOf<Any>(demoAddress(index), visit.id))
+            }
+            return
+        }
         val now = System.currentTimeMillis()
         listOf("마트", "카페", "우체국").forEachIndexed { index, name ->
             val time = now - (3 - index) * 3_600_000L
             val id = beginVisit(0, time, "$name · 예시", true)
+            writableDatabase.execSQL("UPDATE visits SET address=? WHERE id=? AND demo=1", arrayOf<Any>(demoAddress(index), id))
             endVisit(id, "모의 기록", time + 600_000)
             if (index != 1) {
                 event(0, id, "ROW_1_LEFT", 1, "transition", "모의 입력 · 실제 수집 아님", index.toLong(), time + 1000)
             }
         }
     }
+
+    private fun demoAddress(index: Int) = listOf(
+        "서울특별시 가상로 101 (가상 주소)",
+        "서울특별시 가상로 205 (가상 주소)",
+        "서울특별시 가상로 310 (가상 주소)"
+    )[index % 3]
 
     fun deleteAll() {
         locationPolicy = LocationStoragePolicy()

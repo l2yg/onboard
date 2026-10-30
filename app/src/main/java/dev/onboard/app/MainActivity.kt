@@ -3,7 +3,6 @@ package dev.onboard.app
 import android.Manifest
 import android.app.Activity
 import android.app.AlertDialog
-import android.app.DatePickerDialog
 import android.app.Dialog
 import android.content.Intent
 import android.content.Context
@@ -54,6 +53,7 @@ class MainActivity : Activity() {
     private val handler = Handler(Looper.getMainLooper())
     private var monitor: MotionMonitor? = null
     private var navigation: NavigationLink? = null
+    private var routeMessage = ""
     private var parked: Boolean? = null
     private var motionAt = 0L
     private var demo = false
@@ -112,6 +112,7 @@ class MainActivity : Activity() {
             }
         }
         demo = savedInstanceState?.getBoolean("demo") ?: getPreferences(0).getBoolean("demo", false)
+        if (demo) store.seedDemo()
         page = savedInstanceState?.getString("page") ?: "home"
         editingCase = savedInstanceState?.getLong("editing", -1)?.takeIf { it >= 0 }
         itemDraft = savedInstanceState?.getString("item") ?: ""
@@ -125,6 +126,7 @@ class MainActivity : Activity() {
 
     override fun onResume() {
         super.onResume()
+        if (routeMessage.isNotBlank()) toast(routeMessage)
         parked = null
         monitor = MotionMonitor(this) { value ->
             motionAt = SystemClock.elapsedRealtime()
@@ -139,12 +141,11 @@ class MainActivity : Activity() {
     }
     override fun onPause() {
         touching = false; pendingRender = false
-        navigation?.close(); navigation = null
         handler.removeCallbacksAndMessages(null)
         monitor?.close(); monitor = null; parked = null
         super.onPause()
     }
-    override fun onDestroy() { addresses.close(); activeDialog?.dismiss(); store.close(); super.onDestroy() }
+    override fun onDestroy() { navigation?.close(); addresses.close(); activeDialog?.dismiss(); store.close(); super.onDestroy() }
     override fun dispatchTouchEvent(event: MotionEvent): Boolean {
         if (event.actionMasked == MotionEvent.ACTION_DOWN) touching = true
         val handled = super.dispatchTouchEvent(event)
@@ -358,6 +359,9 @@ class MainActivity : Activity() {
         header.addView(LinearLayout(this@MainActivity).apply {
             orientation = LinearLayout.VERTICAL
             addView(label(visit.placeName, 28, ink, true))
+            if (visit.address.isNotBlank() && (visit.demo || visit.label.isNotBlank())) {
+                addView(label(if (visit.demo) "예시 주소 · ${visit.address}" else visit.address, 22, muted))
+            }
             addView(label(if (visit.reason.contains("시각 불명")) "종료 시각 불명" else visit.end?.let {
                 val minutes = ((it - visit.start) / 60_000).coerceAtLeast(0)
                 if (minutes == 0L) "1분 미만 정차" else "${minutes}분 정차"
@@ -380,25 +384,9 @@ class MainActivity : Activity() {
                 else { replayFrom = visit.start; page = "results"; render() }
             }
         }.apply { contentDescription = "${if (page == "results") "메모 남기기" else "여기부터 돌아보기"} · ${visit.placeName}" }, actionLayout())
-        if (!visit.demo && visit.latitude?.isFinite() == true && visit.longitude?.isFinite() == true &&
-            visit.latitude in -90.0..90.0 && visit.longitude in -180.0..180.0) {
-            actions.addView(button("다시 길 안내") {
-                if (parked != true) { toast("정차 확인 후 사용할 수 있어요"); return@button }
-                AlertDialog.Builder(this@MainActivity).setTitle("기록된 정차 위치로 안내할까요?")
-                    .setMessage("현재 위치에서 새 경로를 요청합니다. 기존 내비 안내가 바뀔 수 있습니다. 기록 좌표는 매장 입구나 주차장 진입점과 다를 수 있습니다.")
-                    .setPositiveButton("길 안내 요청") { _, _ ->
-                        if (parked == true && !demo) {
-                            navigation?.close()
-                            navigation = NavigationLink(this@MainActivity, { toast(it) }).also {
-                                it.navigate(visit.latitude, visit.longitude, visit.placeName) {
-                                    parked == true && !demo && SystemClock.elapsedRealtime() - motionAt <= 6_000
-                                }
-                                it.start()
-                            }
-                        }
-                    }.setNegativeButton("취소", null).display()
-            }, actionLayout())
-        }
+        actions.addView(button(if (visit.demo) "길 안내 알아보기" else "다시 길 안내") {
+            requestNavigation(visit)
+        }, actionLayout())
         if (resources.configuration.screenWidthDp >= 1400 && resources.configuration.fontScale <= 1.3f) {
             val row = LinearLayout(this@MainActivity).apply { gravity = Gravity.CENTER_VERTICAL }
             row.addView(header, LinearLayout.LayoutParams(0, -2, 1f))
@@ -407,16 +395,54 @@ class MainActivity : Activity() {
         } else { addView(header); addView(actions) }
     }
 
+    private fun requestNavigation(visit: Visit) {
+        if (!allowed()) return
+        activeDialog?.dismiss()
+        if (visit.demo) {
+            AlertDialog.Builder(this).setTitle("연습용 길 안내")
+                .setMessage("${visit.placeName}\n예시 주소: ${visit.address}\n\n가상 주소로 구성한 연습용 방문입니다. 실제 기록에서는 저장된 좌표를 Pleos 내비에 보내 길 안내를 요청합니다.")
+                .setPositiveButton("확인", null).display()
+            return
+        }
+        val latitude = visit.latitude
+        val longitude = visit.longitude
+        if (latitude == null || longitude == null || !latitude.isFinite() || !longitude.isFinite() ||
+            latitude !in -90.0..90.0 || longitude !in -180.0..180.0) {
+            AlertDialog.Builder(this).setTitle("안내할 위치가 없어요")
+                .setMessage("이 방문에는 좌표가 저장되지 않았습니다. 장소 이름이나 주소만으로 경로를 요청하지 않습니다. 위치가 저장된 실제 방문을 선택해 주세요.")
+                .setPositiveButton("확인", null).display()
+            return
+        }
+        if (parked != true) { toast("정차 확인 후 사용할 수 있어요"); return }
+        AlertDialog.Builder(this).setTitle("기록된 정차 위치로 안내할까요?")
+            .setMessage("${visit.placeName}\n${visit.address}\n\n현재 위치에서 새 경로를 요청합니다. 기존 내비 안내가 바뀔 수 있습니다. 기록 좌표는 매장 입구나 주차장 진입점과 다를 수 있습니다.")
+            .setPositiveButton("길 안내 요청") { _, _ ->
+                if (parked == true && !demo) {
+                    navigation?.close()
+                    navigation = NavigationLink(this, { message ->
+                        routeMessage = message
+                        if (hasWindowFocus()) toast(message)
+                    }).also {
+                        it.navigate(latitude, longitude, visit.placeName, visit.address) {
+                            parked == true && !demo && SystemClock.elapsedRealtime() - motionAt <= 6_000
+                        }
+                        it.start()
+                    }
+                }
+            }.setNegativeButton("취소", null).display()
+    }
+
     private fun showVisit(visit: Visit) {
         if (!allowed()) return
-        val location = if (visit.latitude != null && visit.longitude != null)
+        val location = if (visit.demo) "연습용 방문 · 실제 수집 위치가 아닙니다" else if (visit.latitude != null && visit.longitude != null)
             String.format(Locale.US, "%.5f, %.5f · 정확도 ±%.0fm", visit.latitude, visit.longitude, visit.accuracy)
             else "위치 미확정"
         val body = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL; setPadding(dp(24), dp(12), dp(24), dp(12))
             addView(label("${time(visit.start)} · ${visit.end?.let(::clock) ?: "종료 불명 또는 정차 중"}", 18, ink))
             addView(label(location, 15, muted))
-            if (visit.address.isNotBlank()) addView(label("좌표 기준 주소: ${visit.address}\n실제 방문한 매장이나 건물을 확인한 것은 아닙니다.", 22, muted))
+            if (visit.address.isNotBlank()) addView(label(
+                if (visit.demo) "예시 주소: ${visit.address}" else "좌표 기준 주소: ${visit.address}\n실제 방문한 매장이나 건물을 확인한 것은 아닙니다.", 22, muted))
             store.contextDetails(visit).forEach { addView(label(it, 15, muted)) }
             addView(button("이 시점부터 돌아보기", true) {
                 if (allowed()) { activeDialog?.dismiss(); replayFrom = visit.start; page = "results"; render() }
@@ -434,6 +460,12 @@ class MainActivity : Activity() {
                     .setPositiveButton("닫기", null).display()
                 }
             })
+            for (index in 0 until childCount) {
+                val child = getChildAt(index)
+                if (child is Button) child.layoutParams = LinearLayout.LayoutParams(-1, -2).apply {
+                    topMargin = dp(16)
+                }
+            }
         }
         AlertDialog.Builder(this).setTitle(visit.placeName)
             .setView(ScrollView(this).apply { addView(body) })
@@ -482,7 +514,7 @@ class MainActivity : Activity() {
             addView(label("방문 기록은 7일, 메모는 직접 삭제할 때까지 보관합니다.", 22, muted))
             addView(button("보관 및 수집 안내") {
                 AlertDialog.Builder(this@MainActivity).setTitle("내 기록의 보관과 수집")
-                    .setMessage("기록은 기기에 보관하며 별도 앱 암호는 없습니다. 동일 차량의 같은 OS 사용자는 기록을 볼 수 있습니다.\n\n주소 확인은 Android 시스템 서비스를 이용하며, 좌표 조회를 위한 제공자와의 통신이 발생할 수 있습니다. 조회되지 않아도 기록한 좌표는 유지합니다.\n\n동의 후 기록 시작 이후만 수집하며, 전원 종료·강제 종료 중에는 중단될 수 있습니다. 자동 재시작하지 않습니다.\n\n전체 삭제 또는 앱 삭제 시 모든 자료를 지웁니다.")
+                    .setMessage("기록은 기기에 보관하며 별도 앱 암호는 없습니다. 동일 차량의 같은 OS 사용자는 기록을 볼 수 있습니다.\n\n주소는 Android 시스템 또는 Pleos 내비에서 확인하며, 제공자와의 통신이 발생할 수 있습니다. 내비 주소는 기록 좌표와 100m 이내일 때만 사용합니다. 조회되지 않아도 기록한 좌표는 유지합니다.\n\n동의 후 기록 시작 이후만 수집하며, 전원 종료·강제 종료 중에는 중단될 수 있습니다. 자동 재시작하지 않습니다.\n\n전체 삭제 또는 앱 삭제 시 모든 자료를 지웁니다.")
                     .setPositiveButton("닫기", null).display()
             })
         }
@@ -512,7 +544,7 @@ class MainActivity : Activity() {
         if (demo) { toast("실제 차량 기록 모드로 전환한 후 시작해 주세요"); return }
         if (parked != true) { toast("정차 신호 확인 후 기록을 시작해 주세요"); return }
         AlertDialog.Builder(this).setTitle("차량 이력을 기록할까요?")
-            .setMessage("문 상태·정차·위치·차량 거리계·내비 목적지와 도착 알림을 이 기기에 기록합니다. 저장된 위치의 주소는 Android 시스템 서비스로 조회하며 제공자와의 통신이 발생할 수 있습니다. 알림에서 중지할 수 있습니다. 기록 이전이나 전원 종료 중의 이력은 복원하지 않습니다.")
+            .setMessage("문 상태·정차·위치·차량 거리계·내비 목적지와 도착 알림을 이 기기에 기록합니다. 주소는 Android 시스템 또는 Pleos 내비에서 확인하며 제공자와의 통신이 발생할 수 있습니다. 알림에서 중지할 수 있습니다. 기록 이전이나 전원 종료 중의 이력은 복원하지 않습니다.")
             .setPositiveButton("동의하고 시작") { _, _ ->
                 val permissions = mutableListOf<String>()
                 if (checkSelfPermission(Manifest.permission.ACCESS_FINE_LOCATION) != PackageManager.PERMISSION_GRANTED) {
@@ -551,14 +583,85 @@ class MainActivity : Activity() {
     }
     private fun chooseDay() {
         if (!allowed()) { toast("정차 확인 후 사용할 수 있어요"); return }
-        val cal = Calendar.getInstance().apply { filterDay?.let { timeInMillis = it } }
-        DatePickerDialog(this, { _, y, m, d ->
-            if (allowed()) {
-                cal.set(y, m, d, 0, 0, 0); cal.set(Calendar.MILLISECOND, 0)
-                filterDay = cal.timeInMillis; allVisits = false; render()
+        val today = Calendar.getInstance().apply {
+            set(Calendar.HOUR_OF_DAY, 0); set(Calendar.MINUTE, 0); set(Calendar.SECOND, 0); set(Calendar.MILLISECOND, 0)
+        }
+        val selected = (today.clone() as Calendar).apply { filterDay?.let { timeInMillis = it } }
+        val month = (selected.clone() as Calendar).apply { set(Calendar.DAY_OF_MONTH, 1) }
+        val calendarBody = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL; setPadding(dp(24), dp(8), dp(24), dp(16))
+        }
+        fun drawCalendar() {
+            calendarBody.removeAllViews()
+            calendarBody.addView(label(SimpleDateFormat("M월 d일 EEEE", Locale.KOREA).format(selected.time), 30, ink, true))
+            val navigation = LinearLayout(this).apply { gravity = Gravity.CENTER_VERTICAL }
+            navigation.addView(button("이전 달") { month.add(Calendar.MONTH, -1); drawCalendar() },
+                LinearLayout.LayoutParams(dp(160), -2))
+            navigation.addView(label(SimpleDateFormat("yyyy년 M월", Locale.KOREA).format(month.time), 28, ink, true).apply {
+                gravity = Gravity.CENTER
+            }, LinearLayout.LayoutParams(0, -2, 1f))
+            navigation.addView(button("다음 달") { month.add(Calendar.MONTH, 1); drawCalendar() }.apply {
+                isEnabled = month.get(Calendar.YEAR) < today.get(Calendar.YEAR) ||
+                    (month.get(Calendar.YEAR) == today.get(Calendar.YEAR) && month.get(Calendar.MONTH) < today.get(Calendar.MONTH))
+                alpha = if (isEnabled) 1f else 0.35f
+            }, LinearLayout.LayoutParams(dp(160), -2))
+            calendarBody.addView(navigation, LinearLayout.LayoutParams(-1, -2).apply { topMargin = dp(12); bottomMargin = dp(12) })
+            val weekdays = LinearLayout(this)
+            listOf("일", "월", "화", "수", "목", "금", "토").forEach { day ->
+                weekdays.addView(label(day, 24, muted).apply { gravity = Gravity.CENTER }, LinearLayout.LayoutParams(0, -2, 1f))
             }
-        }, cal.get(Calendar.YEAR), cal.get(Calendar.MONTH), cal.get(Calendar.DAY_OF_MONTH)).also {
-            activeDialog = it; it.datePicker.maxDate = System.currentTimeMillis(); it.show()
+            calendarBody.addView(weekdays)
+            val offset = month.get(Calendar.DAY_OF_WEEK) - Calendar.SUNDAY
+            val count = month.getActualMaximum(Calendar.DAY_OF_MONTH)
+            repeat((offset + count + 6) / 7) { week ->
+                val row = LinearLayout(this)
+                repeat(7) { weekday ->
+                    val day = week * 7 + weekday - offset + 1
+                    val cell = if (day in 1..count) {
+                        val date = (month.clone() as Calendar).apply { set(Calendar.DAY_OF_MONTH, day) }
+                        val chosen = date.timeInMillis == selected.timeInMillis
+                        button(day.toString(), chosen) {
+                            selected.timeInMillis = date.timeInMillis
+                            drawCalendar()
+                        }.apply {
+                            contentDescription = SimpleDateFormat("yyyy년 M월 d일", Locale.KOREA).format(date.time)
+                            isSelected = chosen; isEnabled = date.timeInMillis <= today.timeInMillis
+                            alpha = if (isEnabled) 1f else 0.35f
+                            setPadding(0, dp(8), 0, dp(8))
+                            maxLines = 1
+                        }
+                    } else View(this)
+                    row.addView(cell, LinearLayout.LayoutParams(0, -2, 1f).apply {
+                        marginStart = dp(4); marginEnd = dp(4)
+                    })
+                }
+                calendarBody.addView(row, LinearLayout.LayoutParams(-1, -2).apply { bottomMargin = dp(8) })
+            }
+        }
+        drawCalendar()
+        AlertDialog.Builder(this).setTitle("날짜 선택")
+            .setView(ScrollView(this).apply { addView(calendarBody) })
+            .setPositiveButton("확인") { _, _ ->
+                if (allowed()) { filterDay = selected.timeInMillis; allVisits = false; render() }
+            }.setNegativeButton("취소", null).display()
+        activeDialog?.window?.setLayout(dp(minOf(1120, resources.configuration.screenWidthDp - 48)), -2)
+        (activeDialog as? AlertDialog)?.let { dialog ->
+            listOf(AlertDialog.BUTTON_NEGATIVE, AlertDialog.BUTTON_POSITIVE).forEach { which ->
+                dialog.getButton(which)?.apply {
+                    minWidth = dp(144)
+                    setPadding(dp(24), dp(12), dp(24), dp(12))
+                    val primary = which == AlertDialog.BUTTON_POSITIVE
+                    setTextColor(if (primary) getColor(R.color.on_accent) else ink)
+                    background = RippleDrawable(ColorStateList.valueOf(getColor(R.color.outline)),
+                        shape(if (primary) accent else panel).apply {
+                            if (!primary) setStroke(dp(1), getColor(R.color.outline))
+                        }, null)
+                    (layoutParams as? ViewGroup.MarginLayoutParams)?.let { params ->
+                        params.marginStart = dp(16)
+                        layoutParams = params
+                    }
+                }
+            }
         }
     }
 
